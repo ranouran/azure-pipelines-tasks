@@ -8,7 +8,7 @@ import * as kubectlConfigMap from "./kubernetesconfigmap";
 import * as kubectlSecret from "./kubernetessecret";
 import { getNameSpace } from "./kubernetescommand";
 import trm = require('azure-pipelines-task-lib/toolrunner');
-import { getDeploymentMetadata, IsJsonString } from 'kubernetes-common-v2/image-metadata-helper';
+import { getDeploymentMetadata, IsJsonString, getPublishDeploymentRequestUrl, isDeploymentEntity } from 'kubernetes-common-v2/image-metadata-helper';
 import { WebRequest, WebResponse, sendRequest } from 'utility-common-v2/restutilities';
 
 tl.setResourcePath(path.join(__dirname, '..', 'task.json'));
@@ -18,7 +18,7 @@ tl.cd(tl.getInput("cwd"));
 var registryType = tl.getInput("containerRegistryType", true);
 var command = tl.getInput("command", false);
 const environmentVariableMaximumSize = 32766;
-const deploymentKind = "deployment";
+const addPipelineMetadata = tl.getVariable("ADD_PIPELINE_METADATA");
 
 var kubeconfigfilePath;
 if (command === "logout") {
@@ -113,29 +113,36 @@ function executeKubectlCommand(clusterConnection: ClusterConnection, command: st
                 tl.setVariable('KubectlOutput', result.toString());
             }
 
-            // For each output, check if it contains a JSON object
-            result.forEach(res => {
-                if (IsJsonString(res)) {
-                    const jsonResult = JSON.parse(res);
-                    // Check if the output contains a deployment
-                    if (jsonResult.kind && jsonResult.kind.toLowerCase() === deploymentKind) {
-                        // Get all the pods in this cluster
-                        const allPods = JSON.parse(getAllPods(clusterConnection).stdout);
-                        const clusterInfo = getClusterInfo(clusterConnection).stdout;
-                        const metadata = getDeploymentMetadata(jsonResult, allPods, "None", clusterInfo);
-                        const requestUrl = tl.getVariable("System.TeamFoundationCollectionUri") + tl.getVariable("System.TeamProject") + "/_apis/deployment/deploymentdetails?api-version=5.2-preview.1";
-                        sendRequestToImageStore(JSON.stringify(metadata), requestUrl).then((result) => {
-                            tl.debug("DeploymentDetailsApiResponse: " + JSON.stringify(result));
-                        }, (error) => {
-                            tl.warning("publishToImageMetadataStore failed with error: " + error);
-                        });
+            if (addPipelineMetadata && addPipelineMetadata.toLowerCase() == "true") {
+                // For each output, check if it contains a JSON object
+                result.forEach(res => {
+                    if (IsJsonString(res)) {
+                        const jsonResult = JSON.parse(res);
+                        // Check if the output contains a deployment
+                        if (isDeploymentEntity(jsonResult.kind)) {
+                            // Get all the pods in this cluster
+                            try {
+                                const allPods = JSON.parse(getAllPods(clusterConnection).stdout);
+                                const clusterInfo = getClusterInfo(clusterConnection).stdout;
+                                const metadata = getDeploymentMetadata(jsonResult, allPods, "None", clusterInfo);
+                                const requestUrl = getPublishDeploymentRequestUrl();
+                                sendRequestToImageStore(JSON.stringify(metadata), requestUrl).then((result) => {
+                                    tl.debug("DeploymentDetailsApiResponse: " + JSON.stringify(result));
+                                }, (error) => {
+                                    tl.warning("publishToImageMetadataStore failed with error: " + error);
+                                });
+                            }
+                            catch (e) {
+                                tl.warning("Capturing deployment metadata failed with error: " + e);
+                            }
+                        }
                     }
-                }
-            });
+                });
+            }
         });
 }
 
-export async function sendRequestToImageStore(requestBody: string, requestUrl: string): Promise<any> {
+async function sendRequestToImageStore(requestBody: string, requestUrl: string): Promise<any> {
     const request = new WebRequest();
     const accessToken: string = tl.getEndpointAuthorizationParameter('SYSTEMVSSCONNECTION', 'ACCESSTOKEN', false);
     request.uri = requestUrl;

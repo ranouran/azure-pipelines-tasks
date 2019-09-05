@@ -6,18 +6,29 @@ const matchPatternForDigest = new RegExp(/\@sha256\:(.+)/);
 const matchPatternForFileArgument = new RegExp(/-f\s|-filename\s/);
 const matchPatternForServerUrl = new RegExp(/Kubernetes master is running at (.+)/);
 const appliedConfigurationKey = "kubectl.kubernetes.io/last-applied-configuration";
+const orgUrl = tl.getVariable('System.TeamFoundationCollectionUri');
+const build = "build";
+const hostType = tl.getVariable("System.HostType").toLowerCase();
+const isBuild = hostType === build;
+const deploymentTypes: string[] = ["deployment", "replicaset", "daemonset", "pod", "statefulset"];
 
-export function getDeploymentMetadata(deploymentObject: any, allPods: any, deploymentStrategy: string, clusterInfo: any): any {
+export function getDeploymentMetadata(deploymentObject: any, allPods: any, deploymentStrategy: string, clusterInfo: any, manifestFilePaths?: string[]): any {
     let imageIds: string[] = [];
+    let kind: string = deploymentObject.kind;
     try {
-        let containers = deploymentObject.spec.template.spec.containers;
-        if (containers && containers.length > 0) {
-            containers.forEach(container => {
-                console.log("containerName:" + container.name);
-                // Filter all pods using the container names in this deployment,
-                // and get the imageIds from pod status
-                imageIds = getImageIdsForPodsInDeployment(container.name, allPods.items, deploymentObject.metadata.uid);
-            });
+        if (isPodEntity(kind)) {
+            imageIds = getImageIdsForPod(deploymentObject);
+        }
+        else {
+            let containers = deploymentObject.spec.template.spec.containers;
+            if (containers && containers.length > 0) {
+                containers.forEach(container => {
+                    console.log("containerName:" + container.name);
+                    // Filter all pods using the container names in this deployment,
+                    // and get the imageIds from pod status
+                    imageIds = getImageIdsForPodsInDeployment(container.name, allPods.items);
+                });
+            }
         }
     }
     catch (e) {
@@ -26,8 +37,9 @@ export function getDeploymentMetadata(deploymentObject: any, allPods: any, deplo
     }
 
     let name: string = deploymentObject.metadata && deploymentObject.metadata.name ? deploymentObject.metadata.name : "";
-    let relatedUrls = [getPipelineUrl(deploymentObject), getServerUrl(clusterInfo)];
-    relatedUrls = relatedUrls.concat(getManifestFilePaths());
+    let clusterUrl = getServerUrl(clusterInfo);
+    let relatedUrls = [getPipelineUrl(), clusterUrl];
+    relatedUrls = relatedUrls.concat(manifestFilePaths ? manifestFilePaths : getManifestFilePaths());
 
     const metadataDetails = {
         "Name": name,
@@ -36,14 +48,14 @@ export function getDeploymentMetadata(deploymentObject: any, allPods: any, deplo
         "ResourceUri": imageIds,
         "UserEmail": getUserEmail(),
         "Config": deploymentStrategy,
-        "Address": getEnvironmentResourceAddress(),
+        "Address": getEnvironmentResourceAddress() || clusterUrl,
         "Platform": getPlatform()
     };
 
     return metadataDetails;
 }
 
-export function getImageIdsForPodsInDeployment(containerName: string, pods: any[], ownerId: string): string[] {
+export function getImageIdsForPodsInDeployment(containerName: string, pods: any[]): string[] {
     // The image name in parent.spec.template.spec.containers and in pod.status.containerStatuses is not a constant, example it is redis in former, and redis:latest in latter
     // Hence filtering the pods on the basis of container name which is a constant
     let imageIds: string[] = [];
@@ -56,6 +68,18 @@ export function getImageIdsForPodsInDeployment(containerName: string, pods: any[
                 }
             }
         });
+    });
+
+    return imageIds;
+}
+
+export function getImageIdsForPod(pod: any): string[] {
+    let imageIds: string[] = [];
+    const podStatus = pod.status;
+    podStatus.containerStatuses.forEach(status => {
+        if (status.imageID) {
+            imageIds.push(getImageResourceUrl(status.imageID));
+        }
     });
 
     return imageIds;
@@ -135,10 +159,13 @@ function getEnvironmentResourceAddress(): string {
     return util.format("%s/%s", environmentResourceName, environmentResourceId);
 }
 
-function getPipelineUrl(deployment: any): string {
-    let pipelineUrl: string = "";
-    if (deployment && deployment.metadata && deployment.metadata.annotations) {
-        pipelineUrl = deployment.metadata.annotations["azure-pipelines/runuri"];
+function getPipelineUrl(): string {
+    let pipelineUrl = "";
+    if (isBuild) {
+        pipelineUrl = orgUrl + tl.getVariable("System.TeamProject") + "/_build/results?buildId=" + tl.getVariable("Build.BuildId");
+    }
+    else {
+        pipelineUrl = orgUrl + tl.getVariable("System.TeamProject") + "/_releaseProgress?releaseId=" + tl.getVariable("Release.ReleaseId");
     }
 
     return pipelineUrl;
@@ -171,7 +198,7 @@ function getManifestFilePaths(): string[] {
 
 function getPlatform(): string {
     let platform: string = "Custom";
-    const connectionType = tl.getInput("connectionType", true);
+    const connectionType = tl.getInput("connectionType");
     if (connectionType === "Azure Resource Manager") {
         platform = "AKS";
     }
@@ -186,4 +213,28 @@ export function IsJsonString(str) {
         return false;
     }
     return true;
+}
+
+export function getPublishDeploymentRequestUrl(): string {
+    return orgUrl + tl.getVariable("System.TeamProject") + "/_apis/deployment/deploymentdetails?api-version=5.2-preview.1";
+}
+
+export function isDeploymentEntity(kind: string): boolean {
+    if (!kind) {
+        tl.warning("ResourceKindNotDefined");
+        return false;
+    }
+
+    return deploymentTypes.some((type: string) => {
+        return kind.toLowerCase() === type;
+    });
+}
+
+export function isPodEntity(kind: string): boolean {
+    if (!kind) {
+        tl.warning("ResourceKindNotDefined");
+        return false;
+    }
+
+    return kind.toLowerCase() === "pod";
 }
